@@ -110,9 +110,9 @@
                         <i class="fa-solid fa-chevron-down text-[9px] sm:text-[10px] opacity-80"></i>
                     </button>
 
-                    <button type="button" id="btnClearBerandaFilter" onclick="clearBerandaFilter()" class="hidden shrink-0 items-center gap-1 bg-white/15 hover:bg-white/25 active:scale-95 transition px-2.5 py-2 rounded-xl border border-white/20 text-[11px] sm:text-xs font-semibold backdrop-blur-md whitespace-nowrap" title="Tampilkan Semua Data (Terbaru ke Terlama)">
+                    <!-- Tombol Reset Ikon Saja di Pojok Atas Beranda -->
+                    <button type="button" id="btnClearBerandaFilter" onclick="clearBerandaFilter()" aria-label="Reset Filter Beranda" class="hidden shrink-0 items-center justify-center w-8 h-8 sm:w-9 sm:h-9 bg-white/15 hover:bg-white/25 active:scale-95 transition rounded-xl border border-white/20 text-xs font-semibold backdrop-blur-md" title="Reset Filter & Tampilkan Semua Data">
                         <i class="fa-solid fa-rotate-left text-sky-200 text-xs"></i>
-                        <span>Semua</span>
                     </button>
                 </div>
             </div>
@@ -790,7 +790,7 @@
 
                 <div class="space-y-2.5">
                     <label class="block text-[11px] font-bold uppercase tracking-wider text-slate-600">
-                        Bukti Transfer (Tersimpan ke Google Drive)
+                        Bukti Transfer (Kompresi Otomatis · Google Drive)
                     </label>
 
                     <input type="file" id="bayarBuktiFileInput" accept="image/*" class="hidden" onchange="handleBuktiFileChange(event)">
@@ -961,10 +961,14 @@
         let isVerifyingPin = false;
 
         let currentDataVersion = null;
+        let lastRenderedSnapshotSig = '';
+        let lastChartSnapshotSig = '';
         let hasInitialServerSync = false;
         let isSyncInFlight = false;
         let isMutating = false;
         let pollTickCounter = 0;
+        let consecutiveSyncFailures = 0;
+        let nextRetryTimestamp = 0;
 
         let draftBuktiFoto = null;
         const buktiFotoMemory = {};
@@ -1006,6 +1010,45 @@
         let donutChartInstance = null;
         let lineChartInstance = null;
 
+        // ================= SNAPSHOT DIFFING & RETRY BACKOFF =================
+        function buildDataSnapshotSignature() {
+            const txSig = dataTransaksi.map(t =>
+                `${t.id}|${t.tanggal}|${t.tipe}|${t.kategori}|${t.nominal}|${t.keterangan || ''}`
+            ).join(';;');
+
+            const angSig = dataAnggota.map(a => {
+                const pKeys = Object.keys(a.periods || {}).sort();
+                const pSig = pKeys.map(pk => {
+                    const p = a.periods[pk] || {};
+                    const bUrl = typeof p.buktiFoto === 'string' ? p.buktiFoto : (p.buktiFoto?.url || p.buktiFoto?.dataUrl || '');
+                    return `${pk}:${p.statusBayar || 'belum'}:${p.tanggalBayar || ''}:${p.tanggalDiajukan || ''}:${bUrl}`;
+                }).join(',');
+                return `${a.id}|${a.nama}|${a.noHp || ''}|${a.iuran}|${a.tanggalDaftar || ''}|${pSig}`;
+            }).join(';;');
+
+            const rekSig = `${infoRekening.bank || ''}|${infoRekening.noRek || ''}|${infoRekening.atasNama || ''}|${infoRekening.waBendahara || ''}`;
+            const viewSig = `${berandaFilterActive}|${selectedYear}|${selectedMonth}|${filterStartDate}|${filterEndDate}|${activeMemberStatusFilter}|${activeTxFilter}|${isAdminAuthenticated}|${adminAnggotaFilterActive}|${adminAnggotaFilterYear}|${adminAnggotaFilterMonth}`;
+
+            return `${kasAwal}##${rekSig}##${txSig}##${angSig}##${viewSig}`;
+        }
+
+        function recordSyncSuccess() {
+            consecutiveSyncFailures = 0;
+            nextRetryTimestamp = 0;
+            setSyncBadge('live');
+        }
+
+        function recordSyncFailure(err) {
+            consecutiveSyncFailures++;
+            const backoffMs = Math.min(10000, 1000 * Math.pow(1.6, Math.min(consecutiveSyncFailures, 6)));
+            nextRetryTimestamp = Date.now() + backoffMs;
+            if (err && err.message === 'APPS_SCRIPT_AUTH_REQUIRED') {
+                setSyncBadge('auth_error');
+            } else {
+                setSyncBadge('offline');
+            }
+        }
+
         // ================= PARSER RESPONS FLEKSIBEL LINTAS PERANGKAT =================
         function extractValidPayload(rawJson) {
             if (!rawJson || typeof rawJson !== 'object') return null;
@@ -1044,39 +1087,62 @@
             }
         }
 
-        // ================= API HELPER (GOOGLE APPS SCRIPT REAL-TIME LINTAS HP) =================
-        async function callAppsScriptPost(payload) {
+        // ================= API HELPER (OPTIMISTIC UI + RETRY + DIFFING) =================
+        async function callAppsScriptPost(payload, options = {}) {
+            const { rollbackFn = null, maxRetries = 2 } = options;
             isMutating = true;
             setSyncBadge('saving');
-            try {
-                const json = await fetchJsonSafe(APPS_SCRIPT_URL, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-                    body: JSON.stringify(payload)
-                });
 
-                const serverPayload = extractValidPayload(json);
-                if (json.status === 'success' && serverPayload && (Array.isArray(serverPayload.transaksi) || Array.isArray(serverPayload.anggota))) {
-                    applyServerPayload(serverPayload);
-                } else if (json.status === 'success') {
-                    await fetchAllFromSheet(true);
+            let lastError = null;
+            try {
+                for (let attempt = 0; attempt <= maxRetries; attempt++) {
+                    try {
+                        const json = await fetchJsonSafe(APPS_SCRIPT_URL, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+                            body: JSON.stringify(payload)
+                        });
+
+                        const serverPayload = extractValidPayload(json);
+                        if (json.status === 'success' && serverPayload && (Array.isArray(serverPayload.transaksi) || Array.isArray(serverPayload.anggota))) {
+                            applyServerPayload(serverPayload);
+                        } else if (json.status === 'success') {
+                            await fetchAllFromSheet(true, true);
+                        }
+
+                        recordSyncSuccess();
+                        return json;
+                    } catch (err) {
+                        lastError = err;
+                        if (err.message === 'APPS_SCRIPT_AUTH_REQUIRED') break;
+                        if (attempt < maxRetries) {
+                            await new Promise(r => setTimeout(r, 400 * (attempt + 1)));
+                        }
+                    }
                 }
-                return json;
+
+                throw lastError || new Error('UNKNOWN_POST_ERROR');
             } catch (err) {
                 console.error('GAS POST Error:', err);
+                recordSyncFailure(err);
+
+                if (typeof rollbackFn === 'function') {
+                    rollbackFn();
+                    saveLocalCacheAndRender({ force: true });
+                }
+
                 if (err.message === 'APPS_SCRIPT_AUTH_REQUIRED') {
                     showToast('Akses Apps Script dibatasi! Ubah deployment menjadi "Anyone / Siapa saja".', 'error');
                 } else {
-                    showToast('Gagal menyimpan ke Spreadsheet. Periksa koneksi internet.', 'error');
+                    showToast('Gagal menyimpan ke Spreadsheet. Perubahan dikembalikan.', 'error');
                 }
                 return { status: 'error', message: err.message };
             } finally {
                 isMutating = false;
-                setSyncBadge('live');
             }
         }
 
-        async function fetchAllFromSheet(silent = false) {
+        async function fetchAllFromSheet(silent = false, forceRender = false) {
             if (isSyncInFlight) return;
             isSyncInFlight = true;
             if (!hasInitialServerSync) {
@@ -1088,21 +1154,21 @@
                 const validPayload = extractValidPayload(json);
 
                 if (validPayload) {
-                    applyServerPayload(validPayload);
+                    applyServerPayload(validPayload, { forceRender });
                     hasInitialServerSync = true;
-                    setSyncBadge('live');
+                    recordSyncSuccess();
                 } else {
                     throw new Error('EMPTY_OR_INVALID_PAYLOAD');
                 }
             } catch (err) {
                 if (!silent) console.warn('Sync getAll warning:', err);
-                if (err.message === 'APPS_SCRIPT_AUTH_REQUIRED') {
-                    setSyncBadge('auth_error');
-                    if (!silent) {
+                recordSyncFailure(err);
+                if (!silent) {
+                    if (err.message === 'APPS_SCRIPT_AUTH_REQUIRED') {
                         showToast('Web App Apps Script belum diset akses "Anyone" (Siapa saja).', 'error');
+                    } else {
+                        showToast('Koneksi terganggu, mencoba sinkronisasi ulang otomatis...', 'info');
                     }
-                } else {
-                    setSyncBadge('offline');
                 }
             } finally {
                 isSyncInFlight = false;
@@ -1111,6 +1177,10 @@
 
         async function pollSheetFast() {
             if (document.hidden || isSyncInFlight || isMutating) return;
+
+            if (nextRetryTimestamp && Date.now() < nextRetryTimestamp) {
+                return;
+            }
 
             if (!hasInitialServerSync) {
                 await fetchAllFromSheet(true);
@@ -1125,13 +1195,13 @@
                     const validPayload = extractValidPayload(fullJson);
                     if (validPayload) {
                         applyServerPayload(validPayload);
-                        setSyncBadge('live');
+                        recordSyncSuccess();
                     }
                     return;
                 }
 
                 const ping = await fetchJsonSafe(`${APPS_SCRIPT_URL}?action=ping&_ts=${Date.now()}`);
-                setSyncBadge('live');
+                recordSyncSuccess();
 
                 if (ping && (ping.status === 'ok' || ping.status === 'success') && String(ping.version) !== String(currentDataVersion)) {
                     const fullJson = await fetchJsonSafe(`${APPS_SCRIPT_URL}?action=getAll&_ts=${Date.now()}`);
@@ -1141,14 +1211,16 @@
                     }
                 }
             } catch (err) {
-                setSyncBadge('offline');
+                recordSyncFailure(err);
             } finally {
                 isSyncInFlight = false;
             }
         }
 
-        function applyServerPayload(payload) {
+        function applyServerPayload(payload, options = {}) {
             if (!payload) return;
+            const { forceRender = false } = options;
+
             if (payload.version !== undefined && payload.version !== null) {
                 currentDataVersion = payload.version;
             }
@@ -1196,7 +1268,7 @@
                 });
             }
 
-            saveLocalCacheAndRender();
+            saveLocalCacheAndRender({ force: forceRender });
         }
 
         function setSyncBadge(state) {
@@ -1205,8 +1277,9 @@
             el.style.cursor = 'pointer';
             el.title = 'Klik untuk sinkronkan ulang data dari Spreadsheet';
             el.onclick = () => {
+                nextRetryTimestamp = 0;
                 showToast('Menyinkronkan data dari Spreadsheet...', 'info');
-                fetchAllFromSheet(false);
+                fetchAllFromSheet(false, true);
             };
 
             if (state === 'saving') {
@@ -1220,7 +1293,7 @@
                 el.innerHTML = `<i class="fa-solid fa-lock text-[9px]"></i> Akses Sheet Ditolak`;
             } else if (state === 'offline') {
                 el.className = "inline-flex items-center gap-1 text-[10px] bg-rose-500/30 text-rose-100 border border-rose-300/40 px-2 py-0.5 rounded-full font-semibold";
-                el.innerHTML = `<span class="w-1.5 h-1.5 rounded-full bg-rose-300"></span> Reconnecting`;
+                el.innerHTML = `<span class="w-1.5 h-1.5 rounded-full bg-rose-300"></span> Retry Otomatis`;
             } else {
                 el.className = "inline-flex items-center gap-1 text-[10px] bg-emerald-400/20 text-emerald-100 border border-emerald-300/30 px-2 py-0.5 rounded-full font-semibold";
                 el.innerHTML = `<span class="w-1.5 h-1.5 rounded-full bg-emerald-300 animate-pulse"></span> Live 1s`;
@@ -1433,11 +1506,7 @@
                 setDateRangePanelState(true);
             }
 
-            syncBuktiMemory();
-            renderMonthDisplay();
-            renderBeranda();
-            if (isAdminAuthenticated) renderAdmin();
-            updateCharts();
+            saveLocalCacheAndRender({ force: true });
 
             if (hasDateRangeActive()) {
                 showToast(`Filter rentang tanggal: ${getBerandaFilterSummaryLabel()}`, 'info');
@@ -1485,17 +1554,25 @@
                 : `https://wa.me/?text=${encodedMsg}`;
         }
 
-        function saveLocalCacheAndRender() {
+        function saveLocalCacheAndRender(options = {}) {
+            const { force = false } = options;
             localStorage.setItem('buku_kas_saldo_awal', kasAwal);
             localStorage.setItem('buku_kas_rekening', JSON.stringify(infoRekening));
             localStorage.setItem('buku_kas_transaksi', JSON.stringify(dataTransaksi));
             localStorage.setItem('buku_kas_anggota', JSON.stringify(dataAnggota));
+
+            const currentSig = buildDataSnapshotSignature();
+            if (!force && currentSig === lastRenderedSnapshotSig) {
+                return false;
+            }
+            lastRenderedSnapshotSig = currentSig;
 
             syncBuktiMemory();
             renderBeranda();
             if (isAdminAuthenticated) {
                 renderAdmin();
             }
+            return true;
         }
 
         // ================= HELPER LINK GAMBAR GOOGLE DRIVE =================
@@ -1756,11 +1833,7 @@
 
             setMemberStatusFilter('semua');
 
-            syncBuktiMemory();
-            renderMonthDisplay();
-            renderBeranda();
-            if (isAdminAuthenticated) renderAdmin();
-            updateCharts();
+            saveLocalCacheAndRender({ force: true });
             showToast('Menampilkan semua data dari terbaru ke terlama', 'info');
         }
 
@@ -1773,9 +1846,7 @@
 
         function clearAdminAnggotaFilter() {
             adminAnggotaFilterActive = false;
-            syncBuktiMemory();
-            renderMonthDisplay();
-            renderAdmin();
+            saveLocalCacheAndRender({ force: true });
             showToast('Menampilkan semua data anggota & tagihan', 'info');
         }
 
@@ -1822,17 +1893,16 @@
             setInterval(updateLiveDateTime, 1000);
 
             dataAnggota = dataAnggota.map(a => ensureMemberPeriods(a));
-            syncBuktiMemory();
-            renderMonthDisplay();
             initCharts();
-            renderBeranda();
+            saveLocalCacheAndRender({ force: true });
             syncAdminRekPreview();
 
-            await fetchAllFromSheet();
+            await fetchAllFromSheet(false, true);
             setInterval(pollSheetFast, 1200);
 
             document.addEventListener('visibilitychange', () => {
                 if (!document.hidden) {
+                    nextRetryTimestamp = 0;
                     fetchAllFromSheet(true);
                 }
             });
@@ -1882,7 +1952,7 @@
             });
         }
 
-        // ================= BUKTI FOTO (UPLOAD KE GOOGLE DRIVE & LIHAT BERULANG) =================
+        // ================= BUKTI FOTO (KOMPRESI OTOMATIS + GOOGLE DRIVE) =================
         function handleBuktiFileChange(event) {
             const file = event.target.files?.[0];
             if (!file) return;
@@ -1893,14 +1963,15 @@
                 return;
             }
 
-            compressImageFile(file, 1000, 0.8, (compressedDataUrl) => {
+            compressImageFile(file, 1000, 0.78, (compressedDataUrl) => {
                 draftBuktiFoto = {
-                    name: file.name,
+                    name: file.name.replace(/\.[^.]+$/, '') + '.jpg',
                     dataUrl: compressedDataUrl,
                     isNew: true
                 };
                 renderBuktiDraftUI();
                 updateBayarWaHref();
+                showToast('Foto dikompresi otomatis agar upload cepat & ringan', 'info');
             });
         }
 
@@ -2088,6 +2159,12 @@
             if (!anggota) return;
             const pk = periodKey || getDefaultMemberPeriodKey(anggota);
             const pData = getMemberPeriodData(anggota, pk);
+
+            const prevPeriodBukti = pData.buktiFoto ? { ...pData.buktiFoto } : null;
+            const prevTopBukti = anggota.buktiFoto ? { ...anggota.buktiFoto } : null;
+            const prevName = anggota.buktiFotoName || '';
+            const prevUrl = anggota.buktiFotoUrl || '';
+
             pData.buktiFoto = null;
             anggota.buktiFoto = null;
             anggota.buktiFotoName = '';
@@ -2095,9 +2172,8 @@
             delete buktiFotoMemory[anggota.id];
             delete buktiFotoMemory[`${anggota.id}__${pk}`];
 
-            saveLocalCacheAndRender();
             closeBuktiLightbox();
-            showToast('Menghapus tautan bukti dari Spreadsheet...', 'info');
+            saveLocalCacheAndRender({ force: true });
 
             await callAppsScriptPost({
                 action: 'saveAnggota',
@@ -2108,6 +2184,13 @@
                     periods: anggota.periods,
                     buktiFotoName: '',
                     buktiFotoUrl: ''
+                }
+            }, {
+                rollbackFn: () => {
+                    pData.buktiFoto = prevPeriodBukti;
+                    anggota.buktiFoto = prevTopBukti;
+                    anggota.buktiFotoName = prevName;
+                    anggota.buktiFotoUrl = prevUrl;
                 }
             });
             showToast('Bukti foto berhasil dihapus', 'success');
@@ -2276,11 +2359,19 @@
         async function hapusInfoRekening() {
             if (!confirm('Hapus informasi rekening bendahara saat ini dari Spreadsheet?')) return;
 
+            const prevRek = { ...infoRekening };
             const emptyRek = { bank: '', noRek: '', atasNama: '', waBendahara: '' };
             infoRekening = { ...emptyRek };
-            saveLocalCacheAndRender();
+            saveLocalCacheAndRender({ force: true });
 
-            const res = await callAppsScriptPost({ action: 'saveMetodePembayaran', data: emptyRek });
+            const res = await callAppsScriptPost(
+                { action: 'saveMetodePembayaran', data: emptyRek },
+                {
+                    rollbackFn: () => {
+                        infoRekening = prevRek;
+                    }
+                }
+            );
 
             if (res.status === 'success') {
                 document.getElementById('inputNamaBank').value = '';
@@ -2524,10 +2615,8 @@
                 adminAnggotaFilterActive = true;
                 adminAnggotaFilterYear = tempPickerYear;
                 adminAnggotaFilterMonth = tempPickerMonth;
-                syncBuktiMemory();
-                renderMonthDisplay();
+                saveLocalCacheAndRender({ force: true });
                 toggleMonthPickerModal();
-                renderAdmin();
                 showToast(`Filter anggota & tagihan: ${monthNames[adminAnggotaFilterMonth]} ${adminAnggotaFilterYear}`, 'info');
                 return;
             }
@@ -2545,12 +2634,8 @@
 
             selectedYear = tempPickerYear;
             selectedMonth = tempPickerMonth;
-            syncBuktiMemory();
-            renderMonthDisplay();
+            saveLocalCacheAndRender({ force: true });
             toggleMonthPickerModal();
-            renderBeranda();
-            if (isAdminAuthenticated) renderAdmin();
-            updateCharts();
             showToast(`Menampilkan data: ${monthNames[selectedMonth]} ${selectedYear}`, 'info');
         }
 
@@ -2850,7 +2935,7 @@
             if (tipe === 'pemasukan') document.getElementById('btnFilterMasuk').className = "px-3 py-1 rounded-lg font-medium bg-white text-slate-800 shadow-sm transition font-bold";
             if (tipe === 'pengeluaran') document.getElementById('btnFilterKeluar').className = "px-3 py-1 rounded-lg font-medium bg-white text-slate-800 shadow-sm transition font-bold";
 
-            renderBeranda();
+            saveLocalCacheAndRender({ force: true });
         }
 
         // ================= MODAL LIHAT TAGIHAN =================
@@ -2940,7 +3025,7 @@
             document.getElementById('tagihanModal').classList.add('hidden');
         }
 
-        // ================= MODAL BAYAR TAGIHAN (UPLOAD KE DRIVE) =================
+        // ================= MODAL BAYAR TAGIHAN (OPTIMISTIC + DRIVE) =================
         let activeBayarAnggota = null;
         let activeBayarPeriodKey = null;
 
@@ -2984,11 +3069,7 @@
             const btnTandai = document.getElementById('btnKonfirmasiLunasLangsung');
             btnTandai.innerHTML = `<i class="fa-solid fa-hourglass-half"></i> <span>Saya Sudah Transfer (Menunggu Konfirmasi)</span>`;
             btnTandai.onclick = async () => {
-                btnTandai.disabled = true;
-                btnTandai.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> <span>Mengunggah ke Google Drive...</span>`;
                 await ajukanMenungguKonfirmasi(anggota.id, activeBayarPeriodKey);
-                btnTandai.disabled = false;
-                closeBayarModal();
             };
 
             document.getElementById('bayarModal').classList.remove('hidden');
@@ -3022,6 +3103,10 @@
             const pData = getMemberPeriodData(anggota, periodKey);
             if (pData.statusBayar === 'lunas') return;
 
+            const prevPeriodSnapshot = { ...pData, buktiFoto: pData.buktiFoto ? { ...pData.buktiFoto } : null };
+            const prevTopBukti = anggota.buktiFoto ? { ...anggota.buktiFoto } : null;
+            const localDraftSnapshot = draftBuktiFoto ? { ...draftBuktiFoto } : null;
+
             const todayStr = new Date().toISOString().split('T')[0];
             pData.statusBayar = 'pending';
             pData.tanggalDiajukan = todayStr;
@@ -3029,8 +3114,6 @@
             const existingBukti = resolveMemberBukti(anggota, periodKey);
             const existingUrl = existingBukti?.dataUrl || '';
             const existingName = existingBukti?.name || '';
-
-            const localDraftSnapshot = draftBuktiFoto ? { ...draftBuktiFoto } : null;
 
             if (localDraftSnapshot && localDraftSnapshot.dataUrl) {
                 const tempBukti = {
@@ -3041,8 +3124,12 @@
                 pData.buktiFoto = tempBukti;
                 anggota.buktiFoto = tempBukti;
             }
-            saveLocalCacheAndRender();
+
+            // Optimistic UI: tutup modal & render instan
+            closeBayarModal();
+            saveLocalCacheAndRender({ force: true });
             updatePendingBadge();
+            showToast(`Konfirmasi ${anggota.nama} terkirim, mengunggah bukti...`, 'info');
 
             const payloadData = {
                 ...anggota,
@@ -3057,14 +3144,20 @@
                 payloadData.driveFolderId = TARGET_DRIVE_FOLDER_ID;
             }
 
-            draftBuktiFoto = null;
-
-            const res = await callAppsScriptPost({
-                action: 'saveAnggota',
-                periodKey: periodKey,
-                driveFolderId: TARGET_DRIVE_FOLDER_ID,
-                data: payloadData
-            });
+            const res = await callAppsScriptPost(
+                {
+                    action: 'saveAnggota',
+                    periodKey: periodKey,
+                    driveFolderId: TARGET_DRIVE_FOLDER_ID,
+                    data: payloadData
+                },
+                {
+                    rollbackFn: () => {
+                        Object.assign(pData, prevPeriodSnapshot);
+                        anggota.buktiFoto = prevTopBukti;
+                    }
+                }
+            );
 
             if (res.status === 'success') {
                 const rawUploadedUrl = res.uploadedFile?.url || localDraftSnapshot?.dataUrl || existingUrl;
@@ -3082,11 +3175,11 @@
                         updatedMember.buktiFoto = buktiObj;
                         updatedMember.buktiFotoName = buktiObj.name;
                         updatedMember.buktiFotoUrl = directUrl;
-                        saveLocalCacheAndRender();
+                        saveLocalCacheAndRender({ force: true });
                     }
                 }
                 updatePendingBadge();
-                showToast(`Pembayaran ${anggota.nama} dikirim & tersinkron ke Google Drive!`, 'success');
+                showToast(`Pembayaran ${anggota.nama} tersinkron ke Google Drive!`, 'success');
             }
         }
 
@@ -3257,7 +3350,7 @@
             });
         }
 
-        // ================= ADMIN ACTION HANDLERS (INSTAN TANPA JEDA) =================
+        // ================= ADMIN ACTION HANDLERS (OPTIMISTIC UI + ROLLBACK) =================
         async function handleSaveKasAwal(e) {
             e.preventDefault();
             const rawVal = String(document.getElementById('inputKasAwal').value || '').replace(/[^\d-]/g, '');
@@ -3268,32 +3361,32 @@
                 return;
             }
 
+            const prevKasAwal = kasAwal;
             kasAwal = val;
-            saveLocalCacheAndRender();
+            saveLocalCacheAndRender({ force: true });
+            showToast('Saldo kas diperbarui (menyinkronkan ke Sheet)...', 'info');
 
-            const btn = document.getElementById('btnSimpanKasAwal');
-            const origText = btn.innerText;
-            btn.disabled = true;
-            btn.innerText = 'Menyimpan...';
-
-            const res = await callAppsScriptPost({
-                action: 'saveSaldoKas',
-                sheetName: 'Pengaturan Kas',
-                sheetAliases: ['Pengaturan Kas', 'Saldo Kas', 'Pengaturan'],
-                parameter: 'Saldo kas',
-                nominal: val,
-                saldoKas: val,
-                nilai: val
-            });
-
-            btn.disabled = false;
-            btn.innerText = origText;
+            const res = await callAppsScriptPost(
+                {
+                    action: 'saveSaldoKas',
+                    sheetName: 'Pengaturan Kas',
+                    sheetAliases: ['Pengaturan Kas', 'Saldo Kas', 'Pengaturan'],
+                    parameter: 'Saldo kas',
+                    nominal: val,
+                    saldoKas: val,
+                    nilai: val
+                },
+                {
+                    rollbackFn: () => {
+                        kasAwal = prevKasAwal;
+                        const inp = document.getElementById('inputKasAwal');
+                        if (inp) inp.value = prevKasAwal;
+                    }
+                }
+            );
 
             if (res && res.status === 'success') {
-                showToast('Saldo kas berhasil disimpan ke sheet Pengaturan Kas!', 'success');
-            } else {
-                const errMsg = (res && res.message) || 'Gagal menyimpan saldo kas ke Spreadsheet!';
-                showToast(errMsg, 'error');
+                showToast('Saldo kas tersimpan di sheet Pengaturan Kas!', 'success');
             }
         }
 
@@ -3306,24 +3399,25 @@
                 waBendahara: document.getElementById('inputWaBendahara').value.trim()
             };
 
+            const prevRek = { ...infoRekening };
             infoRekening = { ...rekData };
-            saveLocalCacheAndRender();
+            saveLocalCacheAndRender({ force: true });
             syncAdminRekPreview();
+            showToast('Info rekening diperbarui (menyinkronkan ke Sheet)...', 'info');
 
-            const btn = document.getElementById('btnSimpanRekening');
-            btn.disabled = true;
-            btn.innerText = 'Menyimpan...';
-
-            const res = await callAppsScriptPost({ action: 'saveMetodePembayaran', data: rekData });
-
-            btn.disabled = false;
-            btn.innerText = 'Simpan Info Rekening';
+            const res = await callAppsScriptPost(
+                { action: 'saveMetodePembayaran', data: rekData },
+                {
+                    rollbackFn: () => {
+                        infoRekening = prevRek;
+                        syncAdminRekPreview();
+                    }
+                }
+            );
 
             if (res.status === 'success') {
                 syncAdminRekPreview();
-                showToast('Info rekening disimpan ke Spreadsheet!', 'success');
-            } else {
-                showToast(res.message || 'Gagal menyimpan info rekening!', 'error');
+                showToast('Info rekening tersimpan di Spreadsheet!', 'success');
             }
         }
 
@@ -3337,6 +3431,9 @@
             const pkMonthIdx = (parseInt(pkMonthStr, 10) || 1) - 1;
 
             const pData = getMemberPeriodData(anggota, periodKey);
+            const prevPeriodSnapshot = { ...pData, buktiFoto: pData.buktiFoto ? { ...pData.buktiFoto } : null };
+            const prevTxSnapshot = [...dataTransaksi];
+
             const todayStr = new Date().toISOString().split('T')[0];
             const txDateStr = `${periodKey}-01`;
 
@@ -3359,28 +3456,44 @@
                 dataTransaksi.unshift(newTxObj);
             }
 
-            saveLocalCacheAndRender();
+            saveLocalCacheAndRender({ force: true });
             showToast(`Pembayaran ${anggota.nama} dikonfirmasi LUNAS!`, 'success');
 
             const buktiObj = resolveMemberBukti(anggota, periodKey);
 
-            await callAppsScriptPost({
-                action: 'saveAnggota',
-                periodKey: periodKey,
-                driveFolderId: TARGET_DRIVE_FOLDER_ID,
-                data: {
-                    ...anggota,
-                    periods: anggota.periods,
-                    buktiFotoName: buktiObj?.name || '',
-                    buktiFotoUrl: buktiObj?.dataUrl || ''
+            await callAppsScriptPost(
+                {
+                    action: 'saveAnggota',
+                    periodKey: periodKey,
+                    driveFolderId: TARGET_DRIVE_FOLDER_ID,
+                    data: {
+                        ...anggota,
+                        periods: anggota.periods,
+                        buktiFotoName: buktiObj?.name || '',
+                        buktiFotoUrl: buktiObj?.dataUrl || ''
+                    }
+                },
+                {
+                    rollbackFn: () => {
+                        Object.assign(pData, prevPeriodSnapshot);
+                        dataTransaksi = prevTxSnapshot;
+                    }
                 }
-            });
+            );
 
             if (!sudahAdaTx) {
-                await callAppsScriptPost({
-                    action: 'saveTransaksi',
-                    data: newTxObj
-                });
+                await callAppsScriptPost(
+                    {
+                        action: 'saveTransaksi',
+                        data: newTxObj
+                    },
+                    {
+                        rollbackFn: () => {
+                            Object.assign(pData, prevPeriodSnapshot);
+                            dataTransaksi = prevTxSnapshot;
+                        }
+                    }
+                );
             }
         }
 
@@ -3390,26 +3503,35 @@
 
             const periodKey = targetPeriodKey || resolveMemberPeriodKeyForAdmin(anggota);
             const pData = getMemberPeriodData(anggota, periodKey);
+            const prevPeriodSnapshot = { ...pData, buktiFoto: pData.buktiFoto ? { ...pData.buktiFoto } : null };
+
             pData.statusBayar = 'belum';
             pData.tanggalDiajukan = null;
             pData.tanggalBayar = null;
 
-            saveLocalCacheAndRender();
+            saveLocalCacheAndRender({ force: true });
             showToast(`Pengajuan ${anggota.nama} dikembalikan ke Belum Bayar`, 'info');
 
             const buktiObj = resolveMemberBukti(anggota, periodKey);
 
-            await callAppsScriptPost({
-                action: 'saveAnggota',
-                periodKey: periodKey,
-                driveFolderId: TARGET_DRIVE_FOLDER_ID,
-                data: {
-                    ...anggota,
-                    periods: anggota.periods,
-                    buktiFotoName: buktiObj?.name || '',
-                    buktiFotoUrl: buktiObj?.dataUrl || ''
+            await callAppsScriptPost(
+                {
+                    action: 'saveAnggota',
+                    periodKey: periodKey,
+                    driveFolderId: TARGET_DRIVE_FOLDER_ID,
+                    data: {
+                        ...anggota,
+                        periods: anggota.periods,
+                        buktiFotoName: buktiObj?.name || '',
+                        buktiFotoUrl: buktiObj?.dataUrl || ''
+                    }
+                },
+                {
+                    rollbackFn: () => {
+                        Object.assign(pData, prevPeriodSnapshot);
+                    }
                 }
-            });
+            );
         }
 
         async function batalkanLunasAnggota(anggotaId, targetPeriodKey = null) {
@@ -3418,6 +3540,9 @@
 
             const periodKey = targetPeriodKey || resolveMemberPeriodKeyForAdmin(anggota);
             const pData = getMemberPeriodData(anggota, periodKey);
+            const prevPeriodSnapshot = { ...pData, buktiFoto: pData.buktiFoto ? { ...pData.buktiFoto } : null };
+            const prevTxSnapshot = [...dataTransaksi];
+
             pData.statusBayar = 'belum';
             pData.tanggalBayar = null;
             pData.tanggalDiajukan = null;
@@ -3425,27 +3550,43 @@
             const txId = `tx_iuran_${anggota.id}_${periodKey}`;
             dataTransaksi = dataTransaksi.filter(t => String(t.id) !== txId);
 
-            saveLocalCacheAndRender();
+            saveLocalCacheAndRender({ force: true });
             showToast(`Status bayar ${anggota.nama} dibatalkan`, 'info');
 
             const buktiObj = resolveMemberBukti(anggota, periodKey);
 
-            await callAppsScriptPost({
-                action: 'saveAnggota',
-                periodKey: periodKey,
-                driveFolderId: TARGET_DRIVE_FOLDER_ID,
-                data: {
-                    ...anggota,
-                    periods: anggota.periods,
-                    buktiFotoName: buktiObj?.name || '',
-                    buktiFotoUrl: buktiObj?.dataUrl || ''
+            await callAppsScriptPost(
+                {
+                    action: 'saveAnggota',
+                    periodKey: periodKey,
+                    driveFolderId: TARGET_DRIVE_FOLDER_ID,
+                    data: {
+                        ...anggota,
+                        periods: anggota.periods,
+                        buktiFotoName: buktiObj?.name || '',
+                        buktiFotoUrl: buktiObj?.dataUrl || ''
+                    }
+                },
+                {
+                    rollbackFn: () => {
+                        Object.assign(pData, prevPeriodSnapshot);
+                        dataTransaksi = prevTxSnapshot;
+                    }
                 }
-            });
+            );
 
-            await callAppsScriptPost({ action: 'deleteTransaksi', id: txId });
+            await callAppsScriptPost(
+                { action: 'deleteTransaksi', id: txId },
+                {
+                    rollbackFn: () => {
+                        Object.assign(pData, prevPeriodSnapshot);
+                        dataTransaksi = prevTxSnapshot;
+                    }
+                }
+            );
         }
 
-        // ================= TRANSAKSI MODAL (ADMIN) =================
+        // ================= TRANSAKSI MODAL (OPTIMISTIC UI) =================
         function openModalTambahTransaksi() {
             document.getElementById('modalTxTitle').innerText = 'Tambah Transaksi';
             document.getElementById('txEditId').value = '';
@@ -3487,21 +3628,23 @@
                 keterangan: document.getElementById('txKeterangan').value.trim()
             };
 
+            const prevTxSnapshot = [...dataTransaksi];
             const idx = dataTransaksi.findIndex(x => String(x.id) === String(txObj.id));
             if (idx >= 0) dataTransaksi[idx] = txObj;
             else dataTransaksi.unshift(txObj);
 
-            saveLocalCacheAndRender();
             closeModalTransaksi();
+            saveLocalCacheAndRender({ force: true });
+            showToast('Transaksi ditampilkan instan (menyimpan ke Sheet)...', 'info');
 
-            const btn = document.getElementById('btnSaveTx');
-            btn.disabled = true;
-            btn.innerText = 'Menyimpan...';
-
-            const res = await callAppsScriptPost({ action: 'saveTransaksi', data: txObj });
-
-            btn.disabled = false;
-            btn.innerText = 'Simpan Transaksi';
+            const res = await callAppsScriptPost(
+                { action: 'saveTransaksi', data: txObj },
+                {
+                    rollbackFn: () => {
+                        dataTransaksi = prevTxSnapshot;
+                    }
+                }
+            );
 
             if (res.status === 'success') {
                 showToast('Transaksi tersimpan di Spreadsheet!', 'success');
@@ -3510,16 +3653,25 @@
 
         async function handleDeleteTransaksi(id) {
             if (!confirm('Apakah Anda yakin ingin menghapus transaksi ini dari Spreadsheet?')) return;
+            const prevTxSnapshot = [...dataTransaksi];
             dataTransaksi = dataTransaksi.filter(t => String(t.id) !== String(id));
-            saveLocalCacheAndRender();
+            saveLocalCacheAndRender({ force: true });
+            showToast('Transaksi dihapus (menyinkronkan ke Sheet)...', 'info');
 
-            const res = await callAppsScriptPost({ action: 'deleteTransaksi', id: id });
+            const res = await callAppsScriptPost(
+                { action: 'deleteTransaksi', id: id },
+                {
+                    rollbackFn: () => {
+                        dataTransaksi = prevTxSnapshot;
+                    }
+                }
+            );
             if (res.status === 'success') {
                 showToast('Transaksi berhasil dihapus', 'info');
             }
         }
 
-        // ================= ANGGOTA MODAL (ADMIN) =================
+        // ================= ANGGOTA MODAL (OPTIMISTIC UI) =================
         function openModalTambahAnggota() {
             document.getElementById('modalAnggotaTitle').innerText = 'Tambah Anggota Baru';
             document.getElementById('anggotaEditId').value = '';
@@ -3582,26 +3734,28 @@
                 buktiFotoUrl: existingBukti?.dataUrl || ''
             };
 
+            const prevAnggotaSnapshot = [...dataAnggota];
             const idx = dataAnggota.findIndex(x => String(x.id) === String(angObj.id));
             if (idx >= 0) dataAnggota[idx] = ensureMemberPeriods(angObj);
             else dataAnggota.push(ensureMemberPeriods(angObj));
 
-            saveLocalCacheAndRender();
             closeModalAnggota();
+            saveLocalCacheAndRender({ force: true });
+            showToast('Data anggota ditampilkan instan (menyimpan ke Sheet)...', 'info');
 
-            const btn = document.getElementById('btnSaveAnggota');
-            btn.disabled = true;
-            btn.innerText = 'Menyimpan...';
-
-            const res = await callAppsScriptPost({
-                action: 'saveAnggota',
-                periodKey: periodKey,
-                driveFolderId: TARGET_DRIVE_FOLDER_ID,
-                data: angObj
-            });
-
-            btn.disabled = false;
-            btn.innerText = 'Simpan Anggota';
+            const res = await callAppsScriptPost(
+                {
+                    action: 'saveAnggota',
+                    periodKey: periodKey,
+                    driveFolderId: TARGET_DRIVE_FOLDER_ID,
+                    data: angObj
+                },
+                {
+                    rollbackFn: () => {
+                        dataAnggota = prevAnggotaSnapshot;
+                    }
+                }
+            );
 
             if (res.status === 'success') {
                 showToast('Data anggota tersimpan di Spreadsheet!', 'success');
@@ -3610,16 +3764,25 @@
 
         async function handleDeleteAnggota(id) {
             if (!confirm('Hapus anggota ini dari Spreadsheet?')) return;
+            const prevAnggotaSnapshot = [...dataAnggota];
             dataAnggota = dataAnggota.filter(a => String(a.id) !== String(id));
-            saveLocalCacheAndRender();
+            saveLocalCacheAndRender({ force: true });
+            showToast('Anggota dihapus (menyinkronkan ke Sheet)...', 'info');
 
-            const res = await callAppsScriptPost({ action: 'deleteAnggota', id: id });
+            const res = await callAppsScriptPost(
+                { action: 'deleteAnggota', id: id },
+                {
+                    rollbackFn: () => {
+                        dataAnggota = prevAnggotaSnapshot;
+                    }
+                }
+            );
             if (res.status === 'success') {
                 showToast('Anggota berhasil dihapus', 'info');
             }
         }
 
-        // ================= CHART.JS VISUALIZATION =================
+        // ================= CHART.JS VISUALIZATION (WITH DIFFING) =================
         function initCharts() {
             const donutCtx = document.getElementById('donutChart').getContext('2d');
             donutChartInstance = new Chart(donutCtx, {
@@ -3700,6 +3863,32 @@
                 if (nom > 0) categoryTotals[kat] = (categoryTotals[kat] || 0) + nom;
             });
 
+            let trendYear = new Date().getFullYear();
+            if (hasDateRangeActive()) {
+                const refDate = new Date(filterStartDate || filterEndDate);
+                if (!isNaN(refDate)) trendYear = refDate.getFullYear();
+            } else if (berandaFilterActive) {
+                trendYear = selectedYear;
+            }
+
+            const masukMonthly = Array(12).fill(0);
+            const keluarMonthly = Array(12).fill(0);
+
+            dataTransaksi.forEach(t => {
+                const d = new Date(t.tanggal);
+                if (!isNaN(d) && d.getFullYear() === trendYear) {
+                    const m = d.getMonth();
+                    if (t.tipe === 'pemasukan') masukMonthly[m] += parseFloat(t.nominal);
+                    else if (t.tipe === 'pengeluaran') keluarMonthly[m] += parseFloat(t.nominal);
+                }
+            });
+
+            const chartSig = `${totalPemasukanPeriode}|${totalPengeluaranPeriode}|${JSON.stringify(categoryTotals)}|${trendYear}|${masukMonthly.join(',')}|${keluarMonthly.join(',')}`;
+            if (chartSig === lastChartSnapshotSig) {
+                return;
+            }
+            lastChartSnapshotSig = chartSig;
+
             const sortedCats = Object.entries(categoryTotals).sort((a, b) => b[1] - a[1]);
             const grandTotal = sortedCats.reduce((sum, [, val]) => sum + val, 0);
 
@@ -3740,33 +3929,14 @@
                     }).join('');
                 }
             }
-            donutChartInstance.update();
+            donutChartInstance.update('none');
 
-            let trendYear = new Date().getFullYear();
-            if (hasDateRangeActive()) {
-                const refDate = new Date(filterStartDate || filterEndDate);
-                if (!isNaN(refDate)) trendYear = refDate.getFullYear();
-            } else if (berandaFilterActive) {
-                trendYear = selectedYear;
-            }
             const trendYearLabel = document.getElementById('trendYearLabel');
             if (trendYearLabel) trendYearLabel.innerText = trendYear;
 
-            const masukMonthly = Array(12).fill(0);
-            const keluarMonthly = Array(12).fill(0);
-
-            dataTransaksi.forEach(t => {
-                const d = new Date(t.tanggal);
-                if (!isNaN(d) && d.getFullYear() === trendYear) {
-                    const m = d.getMonth();
-                    if (t.tipe === 'pemasukan') masukMonthly[m] += parseFloat(t.nominal);
-                    else if (t.tipe === 'pengeluaran') keluarMonthly[m] += parseFloat(t.nominal);
-                }
-            });
-
             lineChartInstance.data.datasets[0].data = masukMonthly;
             lineChartInstance.data.datasets[1].data = keluarMonthly;
-            lineChartInstance.update();
+            lineChartInstance.update('none');
         }
 
         // ================= UTILITIES & TOAST =================
