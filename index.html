@@ -961,6 +961,7 @@
         let isVerifyingPin = false;
 
         let currentDataVersion = null;
+        let hasInitialServerSync = false;
         let isSyncInFlight = false;
         let isMutating = false;
         let pollTickCounter = 0;
@@ -1004,6 +1005,227 @@
 
         let donutChartInstance = null;
         let lineChartInstance = null;
+
+        // ================= PARSER RESPONS FLEKSIBEL LINTAS PERANGKAT =================
+        function extractValidPayload(rawJson) {
+            if (!rawJson || typeof rawJson !== 'object') return null;
+            const candidate = (rawJson.data && typeof rawJson.data === 'object' && (Array.isArray(rawJson.data.transaksi) || Array.isArray(rawJson.data.anggota)))
+                ? rawJson.data
+                : rawJson;
+
+            const isValidStatus = rawJson.status === 'ok' || rawJson.status === 'success' || Array.isArray(candidate.transaksi) || Array.isArray(candidate.anggota);
+            if (!isValidStatus) return null;
+
+            return candidate;
+        }
+
+        async function fetchJsonSafe(url, options = {}) {
+            const response = await fetch(url, {
+                method: options.method || 'GET',
+                mode: 'cors',
+                redirect: 'follow',
+                credentials: 'omit',
+                ...(options.body ? { body: options.body } : {}),
+                ...(options.headers ? { headers: options.headers } : {})
+            });
+
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+
+            const text = await response.text();
+            try {
+                return JSON.parse(text);
+            } catch (e) {
+                if (text.includes('ServiceLogin') || text.includes('accounts.google.com')) {
+                    throw new Error('APPS_SCRIPT_AUTH_REQUIRED');
+                }
+                throw new Error('INVALID_JSON_RESPONSE');
+            }
+        }
+
+        // ================= API HELPER (GOOGLE APPS SCRIPT REAL-TIME LINTAS HP) =================
+        async function callAppsScriptPost(payload) {
+            isMutating = true;
+            setSyncBadge('saving');
+            try {
+                const json = await fetchJsonSafe(APPS_SCRIPT_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+                    body: JSON.stringify(payload)
+                });
+
+                const serverPayload = extractValidPayload(json);
+                if (json.status === 'success' && serverPayload && (Array.isArray(serverPayload.transaksi) || Array.isArray(serverPayload.anggota))) {
+                    applyServerPayload(serverPayload);
+                } else if (json.status === 'success') {
+                    await fetchAllFromSheet(true);
+                }
+                return json;
+            } catch (err) {
+                console.error('GAS POST Error:', err);
+                if (err.message === 'APPS_SCRIPT_AUTH_REQUIRED') {
+                    showToast('Akses Apps Script dibatasi! Ubah deployment menjadi "Anyone / Siapa saja".', 'error');
+                } else {
+                    showToast('Gagal menyimpan ke Spreadsheet. Periksa koneksi internet.', 'error');
+                }
+                return { status: 'error', message: err.message };
+            } finally {
+                isMutating = false;
+                setSyncBadge('live');
+            }
+        }
+
+        async function fetchAllFromSheet(silent = false) {
+            if (isSyncInFlight) return;
+            isSyncInFlight = true;
+            if (!hasInitialServerSync) {
+                setSyncBadge('loading');
+            }
+            try {
+                const url = `${APPS_SCRIPT_URL}?action=getAll&_ts=${Date.now()}`;
+                const json = await fetchJsonSafe(url);
+                const validPayload = extractValidPayload(json);
+
+                if (validPayload) {
+                    applyServerPayload(validPayload);
+                    hasInitialServerSync = true;
+                    setSyncBadge('live');
+                } else {
+                    throw new Error('EMPTY_OR_INVALID_PAYLOAD');
+                }
+            } catch (err) {
+                if (!silent) console.warn('Sync getAll warning:', err);
+                if (err.message === 'APPS_SCRIPT_AUTH_REQUIRED') {
+                    setSyncBadge('auth_error');
+                    if (!silent) {
+                        showToast('Web App Apps Script belum diset akses "Anyone" (Siapa saja).', 'error');
+                    }
+                } else {
+                    setSyncBadge('offline');
+                }
+            } finally {
+                isSyncInFlight = false;
+            }
+        }
+
+        async function pollSheetFast() {
+            if (document.hidden || isSyncInFlight || isMutating) return;
+
+            if (!hasInitialServerSync) {
+                await fetchAllFromSheet(true);
+                return;
+            }
+
+            isSyncInFlight = true;
+            pollTickCounter++;
+            try {
+                if (pollTickCounter % 3 === 0) {
+                    const fullJson = await fetchJsonSafe(`${APPS_SCRIPT_URL}?action=getAll&_ts=${Date.now()}`);
+                    const validPayload = extractValidPayload(fullJson);
+                    if (validPayload) {
+                        applyServerPayload(validPayload);
+                        setSyncBadge('live');
+                    }
+                    return;
+                }
+
+                const ping = await fetchJsonSafe(`${APPS_SCRIPT_URL}?action=ping&_ts=${Date.now()}`);
+                setSyncBadge('live');
+
+                if (ping && (ping.status === 'ok' || ping.status === 'success') && String(ping.version) !== String(currentDataVersion)) {
+                    const fullJson = await fetchJsonSafe(`${APPS_SCRIPT_URL}?action=getAll&_ts=${Date.now()}`);
+                    const validPayload = extractValidPayload(fullJson);
+                    if (validPayload) {
+                        applyServerPayload(validPayload);
+                    }
+                }
+            } catch (err) {
+                setSyncBadge('offline');
+            } finally {
+                isSyncInFlight = false;
+            }
+        }
+
+        function applyServerPayload(payload) {
+            if (!payload) return;
+            if (payload.version !== undefined && payload.version !== null) {
+                currentDataVersion = payload.version;
+            }
+            if (typeof payload.kasAwal === 'number' || (typeof payload.kasAwal === 'string' && payload.kasAwal.trim() !== '' && !isNaN(Number(payload.kasAwal)))) {
+                kasAwal = Number(payload.kasAwal);
+            }
+            if (payload.infoRekening && typeof payload.infoRekening === 'object') {
+                infoRekening = payload.infoRekening;
+            }
+            if (Array.isArray(payload.transaksi)) {
+                dataTransaksi = payload.transaksi;
+            }
+
+            if (Array.isArray(payload.anggota)) {
+                const incomingMembers = payload.anggota;
+                dataAnggota = incomingMembers.map(incoming => {
+                    const prev = dataAnggota.find(old => String(old.id) === String(incoming.id));
+                    const merged = ensureMemberPeriods({
+                        ...(prev || {}),
+                        ...incoming,
+                        periods: {
+                            ...((prev && prev.periods) || {}),
+                            ...(incoming.periods || {})
+                        }
+                    });
+
+                    Object.keys(merged.periods).forEach(pk => {
+                        const curBukti = extractBuktiObject(merged.periods[pk]?.buktiFoto);
+                        const prevBukti = extractBuktiObject(prev?.periods?.[pk]?.buktiFoto);
+                        if (!curBukti && prevBukti) {
+                            merged.periods[pk].buktiFoto = prevBukti;
+                        }
+                    });
+
+                    const topBukti = extractBuktiObject(merged.buktiFoto || {
+                        name: merged.buktiFotoName,
+                        url: merged.buktiFotoUrl
+                    }) || extractBuktiObject(prev?.buktiFoto);
+
+                    if (topBukti) {
+                        merged.buktiFoto = topBukti;
+                    }
+
+                    return merged;
+                });
+            }
+
+            saveLocalCacheAndRender();
+        }
+
+        function setSyncBadge(state) {
+            const el = document.getElementById('syncIndicator');
+            if (!el) return;
+            el.style.cursor = 'pointer';
+            el.title = 'Klik untuk sinkronkan ulang data dari Spreadsheet';
+            el.onclick = () => {
+                showToast('Menyinkronkan data dari Spreadsheet...', 'info');
+                fetchAllFromSheet(false);
+            };
+
+            if (state === 'saving') {
+                el.className = "inline-flex items-center gap-1 text-[10px] bg-amber-400/25 text-amber-100 border border-amber-300/40 px-2 py-0.5 rounded-full font-semibold";
+                el.innerHTML = `<i class="fa-solid fa-spinner fa-spin text-[9px]"></i> Menyimpan...`;
+            } else if (state === 'loading') {
+                el.className = "inline-flex items-center gap-1 text-[10px] bg-sky-400/25 text-sky-100 border border-sky-300/40 px-2 py-0.5 rounded-full font-semibold";
+                el.innerHTML = `<i class="fa-solid fa-spinner fa-spin text-[9px]"></i> Memuat Sheet...`;
+            } else if (state === 'auth_error') {
+                el.className = "inline-flex items-center gap-1 text-[10px] bg-rose-600/80 text-white border border-rose-300 px-2 py-0.5 rounded-full font-bold";
+                el.innerHTML = `<i class="fa-solid fa-lock text-[9px]"></i> Akses Sheet Ditolak`;
+            } else if (state === 'offline') {
+                el.className = "inline-flex items-center gap-1 text-[10px] bg-rose-500/30 text-rose-100 border border-rose-300/40 px-2 py-0.5 rounded-full font-semibold";
+                el.innerHTML = `<span class="w-1.5 h-1.5 rounded-full bg-rose-300"></span> Reconnecting`;
+            } else {
+                el.className = "inline-flex items-center gap-1 text-[10px] bg-emerald-400/20 text-emerald-100 border border-emerald-300/30 px-2 py-0.5 rounded-full font-semibold";
+                el.innerHTML = `<span class="w-1.5 h-1.5 rounded-full bg-emerald-300 animate-pulse"></span> Live 1s`;
+            }
+        }
 
         // ================= FILTER STATUS PEMBAYARAN ANGGOTA, JUMLAH & NOMINAL =================
         function updateMemberStatusFilterStyles() {
@@ -1373,142 +1595,6 @@
             return null;
         }
 
-        // ================= API HELPER (GOOGLE APPS SCRIPT REAL-TIME 1-2s) =================
-        async function callAppsScriptPost(payload) {
-            isMutating = true;
-            setSyncBadge('saving');
-            try {
-                const res = await fetch(APPS_SCRIPT_URL, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-                    body: JSON.stringify(payload)
-                });
-                const json = await res.json();
-                if (json.status === 'success' && json.data) {
-                    applyServerPayload(json.data);
-                } else if (json.status === 'success') {
-                    await fetchAllFromSheet(true);
-                }
-                return json;
-            } catch (err) {
-                console.error('GAS POST Error:', err);
-                showToast('Gagal terhubung ke Google Sheets. Periksa koneksi / URL Apps Script.', 'error');
-                return { status: 'error', message: err.message };
-            } finally {
-                isMutating = false;
-                setSyncBadge('live');
-            }
-        }
-
-        async function fetchAllFromSheet(silent = false) {
-            if (isSyncInFlight) return;
-            isSyncInFlight = true;
-            try {
-                const res = await fetch(`${APPS_SCRIPT_URL}?action=getAll&t=${Date.now()}`, { cache: 'no-store' });
-                const json = await res.json();
-                if (json && json.status === 'ok') {
-                    applyServerPayload(json);
-                    setSyncBadge('live');
-                }
-            } catch (err) {
-                if (!silent) console.warn('Sync getAll warning:', err);
-                setSyncBadge('offline');
-            } finally {
-                isSyncInFlight = false;
-            }
-        }
-
-        async function pollSheetFast() {
-            if (document.hidden || isSyncInFlight || isMutating) return;
-            isSyncInFlight = true;
-            pollTickCounter++;
-            try {
-                if (pollTickCounter % 3 === 0) {
-                    const fullRes = await fetch(`${APPS_SCRIPT_URL}?action=getAll&t=${Date.now()}`, { cache: 'no-store' });
-                    const fullJson = await fullRes.json();
-                    if (fullJson && fullJson.status === 'ok') {
-                        applyServerPayload(fullJson);
-                        setSyncBadge('live');
-                    }
-                    return;
-                }
-
-                const res = await fetch(`${APPS_SCRIPT_URL}?action=ping&t=${Date.now()}`, { cache: 'no-store' });
-                const ping = await res.json();
-                setSyncBadge('live');
-
-                if (ping && ping.status === 'ok' && String(ping.version) !== String(currentDataVersion)) {
-                    const fullRes = await fetch(`${APPS_SCRIPT_URL}?action=getAll&t=${Date.now()}`, { cache: 'no-store' });
-                    const fullJson = await fullRes.json();
-                    if (fullJson && fullJson.status === 'ok') {
-                        applyServerPayload(fullJson);
-                    }
-                }
-            } catch (err) {
-                setSyncBadge('offline');
-            } finally {
-                isSyncInFlight = false;
-            }
-        }
-
-        function applyServerPayload(payload) {
-            currentDataVersion = payload.version;
-            if (typeof payload.kasAwal === 'number' || (typeof payload.kasAwal === 'string' && payload.kasAwal.trim() !== '' && !isNaN(Number(payload.kasAwal)))) {
-                kasAwal = Number(payload.kasAwal);
-            }
-            infoRekening = payload.infoRekening || { bank: '', noRek: '', atasNama: '', waBendahara: '' };
-            dataTransaksi = Array.isArray(payload.transaksi) ? payload.transaksi : [];
-
-            const incomingMembers = Array.isArray(payload.anggota) ? payload.anggota : [];
-            dataAnggota = incomingMembers.map(incoming => {
-                const prev = dataAnggota.find(old => old.id === incoming.id);
-                const merged = ensureMemberPeriods({
-                    ...(prev || {}),
-                    ...incoming,
-                    periods: {
-                        ...((prev && prev.periods) || {}),
-                        ...(incoming.periods || {})
-                    }
-                });
-
-                Object.keys(merged.periods).forEach(pk => {
-                    const curBukti = extractBuktiObject(merged.periods[pk]?.buktiFoto);
-                    const prevBukti = extractBuktiObject(prev?.periods?.[pk]?.buktiFoto);
-                    if (!curBukti && prevBukti) {
-                        merged.periods[pk].buktiFoto = prevBukti;
-                    }
-                });
-
-                const topBukti = extractBuktiObject(merged.buktiFoto || {
-                    name: merged.buktiFotoName,
-                    url: merged.buktiFotoUrl
-                }) || extractBuktiObject(prev?.buktiFoto);
-
-                if (topBukti) {
-                    merged.buktiFoto = topBukti;
-                }
-
-                return merged;
-            });
-
-            saveLocalCacheAndRender();
-        }
-
-        function setSyncBadge(state) {
-            const el = document.getElementById('syncIndicator');
-            if (!el) return;
-            if (state === 'saving') {
-                el.className = "inline-flex items-center gap-1 text-[10px] bg-amber-400/25 text-amber-100 border border-amber-300/40 px-2 py-0.5 rounded-full font-semibold";
-                el.innerHTML = `<i class="fa-solid fa-spinner fa-spin text-[9px]"></i> Menyimpan...`;
-            } else if (state === 'offline') {
-                el.className = "inline-flex items-center gap-1 text-[10px] bg-rose-500/30 text-rose-100 border border-rose-300/40 px-2 py-0.5 rounded-full font-semibold";
-                el.innerHTML = `<span class="w-1.5 h-1.5 rounded-full bg-rose-300"></span> Reconnecting`;
-            } else {
-                el.className = "inline-flex items-center gap-1 text-[10px] bg-emerald-400/20 text-emerald-100 border border-emerald-300/30 px-2 py-0.5 rounded-full font-semibold";
-                el.innerHTML = `<span class="w-1.5 h-1.5 rounded-full bg-emerald-300 animate-pulse"></span> Live 1s`;
-            }
-        }
-
         // ================= LIVE DATE & CLOCK =================
         function updateLiveDateTime() {
             const now = new Date();
@@ -1872,7 +1958,7 @@
         }
 
         function renderBuktiLihatPill(anggotaId, periodKey = null) {
-            const anggota = dataAnggota.find(a => a.id === anggotaId);
+            const anggota = dataAnggota.find(a => String(a.id) === String(anggotaId));
             const bukti = resolveMemberBukti(anggota, periodKey);
             if (!bukti || !bukti.dataUrl) return '';
 
